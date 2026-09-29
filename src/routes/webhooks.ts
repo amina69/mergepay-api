@@ -1,12 +1,12 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { config } from "../config";
 import { prisma } from "../db";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { requireAdmin, requireMembership } from "../services/access";
+import { requireMembership, requireAdmin } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { WEBHOOK_EVENT_TYPES } from "../services/event";
-import { ipKey } from "../services/rate-limit-keys";
+import { rateLimited } from "../lib/rate-limit";
 import {
   applySep24Callback,
   sep24CallbackSchema,
@@ -80,11 +80,23 @@ async function sep24CallbackRoute(app: FastifyInstance) {
   app.post(
     "/api/webhooks/sep24",
     {
-      config: {
-        rateLimit: {
-          max: config.SEP24_RATE_LIMIT_MAX,
-          timeWindow: config.SEP24_RATE_LIMIT_WINDOW_MS,
-          keyGenerator: ipKey("sep24.webhook"),
+      ...rateLimited("sep24Webhook"),
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Process SEP-24 anchor webhook (HMAC-signed)",
+        description:
+          "Accepts SEP-24 transaction status callbacks authenticated with a pre-shared HMAC-SHA256 secret.",
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              received: { type: "boolean" },
+              status: { type: "string" },
+              matched: { type: "integer" },
+              updated: { type: "integer" },
+            },
+          },
         },
       },
     },
@@ -230,7 +242,10 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return reply.code(201).send({ webhook: publicWebhook(webhook, true) });
   });
 
-  app.post("/groups/:groupId/webhooks", async (req) => {
+  const asMember = { preHandler: requireGroupRole("member", { param: "groupId" }) };
+  const asAdmin = { preHandler: requireGroupRole("admin", { param: "groupId" }) };
+
+  app.post("/groups/:groupId/webhooks", asAdmin, async (req) => {
     const auth = requireUser(req);
     const { groupId } = paramsSchema.parse(req.params);
     const body = createSchema.parse(req.body);
@@ -273,10 +288,8 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return { webhook: publicWebhook(webhook, true) };
   });
 
-  app.get("/groups/:groupId/webhooks", async (req) => {
-    const auth = requireUser(req);
+  app.get("/groups/:groupId/webhooks", asMember, async (req) => {
     const { groupId } = paramsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const webhooks = await (prisma as any).webhook.findMany({
       where: { groupId },
@@ -286,10 +299,8 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return { webhooks: webhooks.map((webhook: any) => publicWebhook(webhook)) };
   });
 
-  app.delete("/groups/:groupId/webhooks/:webhookId", async (req) => {
-    const auth = requireUser(req);
+  app.delete("/groups/:groupId/webhooks/:webhookId", asAdmin, async (req) => {
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
-    await requireAdmin(groupId, auth.id);
 
     const webhook = await (prisma as any).webhook.findFirst({
       where: { id: webhookId, groupId },
@@ -300,10 +311,9 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return { deleted: true };
   });
 
-  app.post("/groups/:groupId/webhooks/:webhookId/test", async (req) => {
+  app.post("/groups/:groupId/webhooks/:webhookId/test", asMember, async (req) => {
     const auth = requireUser(req);
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const webhook = await (prisma as any).webhook.findFirst({
       where: { id: webhookId, groupId, enabled: true },
@@ -319,13 +329,12 @@ async function webhookManagementRoutes(app: FastifyInstance) {
       groupId,
     }).catch(() => undefined);
 
+
     return { queued: true };
   });
 
-  app.get("/groups/:groupId/webhooks/:webhookId/deliveries", async (req) => {
-    const auth = requireUser(req);
+  app.get("/groups/:groupId/webhooks/:webhookId/deliveries", asMember, async (req) => {
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const webhook = await (prisma as any).webhook.findFirst({
       where: { id: webhookId, groupId },
