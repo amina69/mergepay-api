@@ -92,6 +92,23 @@ Guarantees:
 stream, `settlementCursor` walks the settlement stream, with metadata in `meta`
 and `settlementMeta` respectively.
 
+### Expense list filters (`GET /groups/:id/expenses`)
+
+The group expense list extends the shared pagination parameters with filters
+(defined in [../src/services/expenses.ts](../src/services/expenses.ts)). Filters
+compose with the cursor rather than replacing it, so a filtered scan pages
+exactly like an unfiltered one.
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `asset` | `"XLM"` \| `"USDC"` | Filter by asset code. Other codes are a `VALIDATION_ERROR` |
+| `status` | `"PENDING"` \| `"SETTLED"` | Settlement state of the whole expense: `SETTLED` requires every share settled, `PENDING` at least one outstanding |
+| `startDate` / `endDate` | ISO 8601 datetime | Inclusive `createdAt` bounds. A reversed range is `INVALID_RANGE`, not an empty page |
+| `includeTotal` | `"true"` \| `"false"` | Opt-in `meta.total` count. Counting a filtered set is a second query over every matching row, so clients that need a total ask for it explicitly |
+
+The count behind `includeTotal` covers the filters but not the cursor, so the
+total stays stable while a client pages through the result.
+
 ---
 
 ## Idempotency
