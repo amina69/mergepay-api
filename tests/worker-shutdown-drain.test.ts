@@ -8,12 +8,12 @@
  * tests pin the ordering — drain first, release second — and the bounded
  * fallback when a job outruns the drain budget.
  *
- * The cycle is held open through `reconcileSettlements`, a real dependency of
+ * The cycle is held open through `cleanupChallenges`, a real dependency of
  * `runWorkerCycle`, so the drain is exercised through the worker's own code
  * path rather than a re-implementation of it.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
   settlement: {
@@ -35,22 +35,17 @@ vi.mock("../src/db", () => ({
     anchorSession: h.anchorSession,
     groupInvite: h.groupInvite,
     $executeRaw: vi.fn(async () => 1),
+    $transaction: vi.fn(async (arg: any) =>
+      typeof arg === "function" ? arg({ settlement: h.settlement, anchorSession: h.anchorSession }) : Promise.all(arg)
+    ),
+    $disconnect: vi.fn(async () => {}),
   },
 }));
 
-vi.mock("../src/services/settlement-reconciliation", () => ({
-  reconcileSettlements: vi.fn(async () => {
+vi.mock("../src/worker/tasks/cleanup-challenges", () => ({
+  cleanupChallenges: vi.fn(async () => {
     await h.gate.wait();
   }),
-}));
-
-vi.mock("../src/worker/reconciliation", () => ({
-  startReconciliation: () => () => {},
-  reconcileAnchors: vi.fn(async () => {}),
-}));
-
-vi.mock("../src/worker/tasks/cleanup-challenges", () => ({
-  cleanupChallenges: vi.fn(async () => {}),
 }));
 
 const { startWorker } = await import("../src/worker/index");
@@ -71,13 +66,20 @@ function ownLeaseReleases(spy: { mock: { calls: unknown[][] } }): unknown[] {
 }
 
 describe("worker shutdown drain", () => {
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
     h.gate.wait = async () => {};
     h.settlement.findMany.mockResolvedValue([]);
     h.anchorSession.findMany.mockResolvedValue([]);
     h.settlement.updateMany.mockResolvedValue({ count: 0 });
     h.anchorSession.updateMany.mockResolvedValue({ count: 0 });
+  });
+
+  afterEach(() => {
+    exitSpy.mockRestore();
   });
 
   it("waits for the in-flight cycle before releasing any lease", async () => {
