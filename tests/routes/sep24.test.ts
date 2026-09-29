@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import jwt from "jsonwebtoken";
+import { Keypair } from "@stellar/stellar-sdk";
+import { sep24InteractiveRequestSchema } from "../../src/schemas/sep24";
 
 const h = vi.hoisted(() => {
   const prisma: any = {
@@ -7,8 +9,10 @@ const h = vi.hoisted(() => {
       findMany: vi.fn(async () => []),
       findUnique: vi.fn(async () => null),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     auditLog: { create: vi.fn(async () => ({ id: "audit_1" })) },
+    statusHistory: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
   };
   const getToml = vi.fn();
@@ -50,12 +54,13 @@ function anchorToken(over: Record<string, unknown> = {}, key = SIGNING_KEY) {
 
 function callback(
   payload: unknown,
-  token: string | null = anchorToken()
+  token: string | null = anchorToken(),
+  query = ""
 ) {
   clientAddress += 1;
   return app.inject({
     method: "POST",
-    url: "/api/sep24/callback",
+    url: `/api/sep24/callback${query}`,
     headers: {
       "content-type": "application/json",
       ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -87,6 +92,7 @@ beforeEach(async () => {
 
   prisma.anchorSession.findMany.mockResolvedValue([]);
   prisma.anchorSession.findUnique.mockResolvedValue(null);
+  prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
   prisma.anchorSession.update.mockImplementation(async ({ data }: any) => ({
     ...session(),
     ...data,
@@ -201,6 +207,32 @@ describe("POST /api/sep24/callback — payload validation", () => {
     expect(res.statusCode).toBe(200);
   });
 
+  it("rejects an unexpected query parameter before database lookup", async () => {
+    const res = await callback(
+      { transaction: { id: "anchor_tx_1", status: "completed" } },
+      anchorToken(),
+      "?unexpected=value"
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(prisma.anchorSession.findMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed Stellar transaction hash before database lookup", async () => {
+    const res = await callback({
+      transaction: {
+        id: "anchor_tx_1",
+        status: "completed",
+        stellar_transaction_id: "not-a-stellar-hash",
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(prisma.anchorSession.findMany).not.toHaveBeenCalled();
+  });
+
   it("ignores unknown anchor-specific fields", async () => {
     prisma.anchorSession.findMany.mockResolvedValue([session()]);
     prisma.anchorSession.findUnique.mockResolvedValue(session());
@@ -227,7 +259,7 @@ describe("POST /api/sep24/callback — state updates", () => {
     });
 
     expect(res.json()).toMatchObject({ matched: 1, updated: 1 });
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ status: "completed" }),
       })
@@ -278,7 +310,7 @@ describe("POST /api/sep24/callback — state updates", () => {
     });
 
     expect(res.json()).toMatchObject({ matched: 1, updated: 0 });
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("ignores a transition that would regress a terminal session", async () => {
@@ -291,7 +323,7 @@ describe("POST /api/sep24/callback — state updates", () => {
     });
 
     expect(res.json().updated).toBe(0);
-    expect(prisma.anchorSession.update).not.toHaveBeenCalled();
+    expect(prisma.anchorSession.updateMany).not.toHaveBeenCalled();
   });
 
   it("returns 200 and audits when no session tracks the transaction", async () => {
@@ -322,7 +354,7 @@ describe("POST /api/sep24/callback — state updates", () => {
       },
     });
 
-    expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           failureReason: "bank rejected the transfer",
@@ -342,5 +374,35 @@ describe("POST /api/sep24/callback — state updates", () => {
     });
 
     expect(res.statusCode).toBe(200);
+  });
+});
+
+describe("SEP-24 interactive parameters", () => {
+  it("accepts a valid asset, account, and memo pair", () => {
+    const result = sep24InteractiveRequestSchema.safeParse({
+      assetCode: "USDC",
+      account: Keypair.random().publicKey(),
+      memo: "invoice42",
+      memoType: "text",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a memo without a memo type", () => {
+    const result = sep24InteractiveRequestSchema.safeParse({
+      assetCode: "XLM",
+      memo: "42",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an invalid account and unsupported memo type", () => {
+    const result = sep24InteractiveRequestSchema.safeParse({
+      assetCode: "XLM",
+      account: "not-a-stellar-account",
+      memo: "42",
+      memoType: "binary",
+    });
+    expect(result.success).toBe(false);
   });
 });

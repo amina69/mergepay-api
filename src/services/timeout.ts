@@ -6,7 +6,12 @@
  * so callers can distinguish timeout from transport failure from HTTP error.
  */
 
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
+import {
+  ProviderError,
+  retryAfterSeconds,
+  type ProviderFailureCategory,
+} from "../lib/provider-error";
 
 // ─── Error types ────────────────────────────────────────────────────────────
 
@@ -49,12 +54,19 @@ export class TransportError extends Error {
  * Wraps an async operation with a bounded timeout using AbortController.
  *
  * The `signal` is passed to the operation so it can cancel in-flight I/O.
- * If the timeout fires before the operation completes, the operation is
+ * If the timeout fires before the operation completes, the promise is
  * rejected with a `TimeoutError`.
  *
  * @param operation - A human-readable label for the operation (used in errors and logs).
  * @param timeoutMs - Maximum time in milliseconds before the operation is aborted.
  * @param fn - The actual async work, receiving the AbortSignal.
+ * @returns Whatever `fn` resolves to, provided it beats the deadline.
+ * @throws {TimeoutError} when `timeoutMs` elapses first, or when `fn` rejects
+ *   with an `AbortError` (the abort was ours).
+ * @throws {TransportError} wrapping any unrecognized rejection from `fn`, so
+ *   callers can classify a socket/DNS failure without string-matching.
+ * @throws Re-throws an `AppError` from `fn` unchanged — a deliberate upstream
+ *   answer is not a transport problem.
  */
 export async function withTimeout<T>(
   operation: string,
@@ -215,4 +227,106 @@ export function toAppError(error: unknown, fallbackMessage: string): ReturnType<
   }
   const message = error instanceof Error ? error.message : String(error);
   return Errors.upstream(`${fallbackMessage}: ${message}`);
+}
+
+// ─── Provider failure normalization ─────────────────────────────────────────
+
+/** Where an HTTP status hides on SDK/fetch-shaped errors. */
+function statusOf(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
+  const candidate = (error as {
+    status?: unknown;
+    statusCode?: unknown;
+    response?: { status?: unknown };
+  });
+  const value = candidate.response?.status ?? candidate.status ?? candidate.statusCode;
+  return typeof value === "number" ? value : null;
+}
+
+/**
+ * Extract Horizon result codes (`tx_failed`, `op_underfunded`, …) from an
+ * SDK error. These are safe provider identifiers — the only part of an
+ * upstream error allowed to survive into a client message or ordinary log.
+ */
+function resultCodesOf(error: unknown): string[] | null {
+  if (!error || typeof error !== "object") return null;
+  const data = (error as {
+    response?: { data?: { extras?: { result_codes?: unknown }; result_codes?: unknown } };
+  }).response?.data;
+  const raw = data?.extras?.result_codes ?? data?.result_codes;
+  if (!raw || typeof raw !== "object") return null;
+  const values = Object.values(raw).flatMap((value) => {
+    // `operations` arrives as an array of code strings; anything else that is
+    // not a plain string is dropped rather than stringified.
+    if (Array.isArray(value)) {
+      return value.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+    }
+    return typeof value === "string" ? [value] : [];
+  });
+  return values.length > 0 ? values : null;
+}
+
+export interface ProviderCallContext {
+  /** Stable provider identifier, e.g. "horizon" or "anchor". */
+  provider: string;
+  /** Operation label used in errors and logs, e.g. "Horizon.loadAccount". */
+  operation: string;
+  /** Generic client-safe message for the converted error. */
+  fallbackMessage: string;
+}
+
+/**
+ * Normalize anything a provider call threw into a typed `ProviderError`
+ * carrying a `ProviderFailureCategory`:
+ *
+ *   - intentional AppErrors pass through unchanged
+ *   - TimeoutError / TransportError map to their categories
+ *   - Horizon result codes map to "rejected" (permanent)
+ *   - upstream HTTP status drives rate_limited / unavailable / rejected
+ *   - anything else is treated as unavailable
+ *
+ * The original error's message text is never copied into the result, so
+ * upstream payloads cannot leak into client responses.
+ */
+export function toProviderError(
+  error: unknown,
+  ctx: ProviderCallContext
+): AppError {
+  if (error instanceof AppError) return error;
+  if (error instanceof TimeoutError) {
+    return new ProviderError({ ...ctx, message: ctx.fallbackMessage, category: "timeout" });
+  }
+  if (error instanceof TransportError && statusOf(error.cause) === null) {
+    return new ProviderError({ ...ctx, message: ctx.fallbackMessage, category: "transport" });
+  }
+
+  // withTimeout wraps unknown SDK failures as TransportError. Preserve the
+  // underlying HTTP response so rate limits and their headers are not lost.
+  const upstreamError = error instanceof TransportError && statusOf(error.cause) !== null
+    ? error.cause
+    : error;
+  const codes = resultCodesOf(upstreamError);
+  const status = statusOf(upstreamError);
+  const category: ProviderFailureCategory = codes
+    ? "rejected"
+    : status === 429
+      ? "rate_limited"
+      : status !== null && status >= 500
+        ? "unavailable"
+        : status !== null && status >= 400
+          ? "rejected"
+          : "unavailable";
+
+  return new ProviderError({
+    provider: ctx.provider,
+    operation: ctx.operation,
+    message: ctx.fallbackMessage,
+    category,
+    detail: codes ?? undefined,
+    retryAfterSeconds: category === "rate_limited" && ctx.provider === "horizon"
+      ? retryAfterSeconds(upstreamError)
+      : undefined,
+  });
 }
