@@ -13,6 +13,7 @@ import {
   verifySep24Signature,
 } from "../services/sep24";
 import { createWebhookSecret, dispatchWebhook } from "../services/webhook";
+import { audit } from "../services/audit";
 
 const paramsSchema = z.object({ groupId: z.string().min(1) });
 const webhookParamsSchema = paramsSchema.extend({
@@ -167,25 +168,58 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     const body = registerSchema.parse(req.body);
 
     if (body.groupId) {
-      await requireMembership(body.groupId, auth.id);
+      // A group webhook streams the group's financial events (settlements,
+      // expense changes) to a caller-supplied URL, so registering one is an
+      // administration decision, not an ordinary membership privilege — the
+      // same bar as treasury withdrawal and member removal. It also runs
+      // inside the same transaction as the row insert so a caller demoted
+      // between the check and the write cannot slip an ex-admin's endpoint
+      // through (the atomicity convention every other admin action here
+      // follows).
+      const webhook = await prisma.$transaction(async (tx) => {
+        await requireAdmin(body.groupId!, auth.id, tx);
 
-      const count = await prisma.webhook.count({
-        where: { groupId: body.groupId },
+        const count = await tx.webhook.count({
+          where: { groupId: body.groupId },
+        });
+        if (count >= 10) {
+          throw Errors.badRequest(
+            "webhook_limit_reached",
+            "A group can have at most 10 webhooks"
+          );
+        }
+
+        return tx.webhook.create({
+          data: {
+            groupId: body.groupId,
+            // A group registration belongs to the group, not to whoever
+            // created it, so it keeps working after that member leaves.
+            userId: null,
+            url: body.url,
+            secret: createWebhookSecret(),
+            events: body.events,
+            enabled: true,
+          },
+        });
       });
-      if (count >= 10) {
-        throw Errors.badRequest(
-          "webhook_limit_reached",
-          "A group can have at most 10 webhooks"
-        );
-      }
+
+      await audit({
+        userId: auth.id,
+        groupId: body.groupId,
+        action: "webhook.register",
+        entityType: "webhook",
+        entityId: webhook.id,
+        metadata: { url: body.url, events: body.events },
+      });
+
+      return reply.code(201).send({ webhook: publicWebhook(webhook, true) });
     }
 
     const webhook = await prisma.webhook.create({
       data: {
-        groupId: body.groupId ?? null,
-        // A group registration belongs to the group, not to whoever created
-        // it, so it keeps working after that member leaves.
-        userId: body.groupId ? null : auth.id,
+        groupId: null,
+        // A personal registration stays owned by the caller.
+        userId: auth.id,
         url: body.url,
         secret: createWebhookSecret(),
         events: body.events,
@@ -199,26 +233,41 @@ async function webhookManagementRoutes(app: FastifyInstance) {
   app.post("/groups/:groupId/webhooks", async (req) => {
     const auth = requireUser(req);
     const { groupId } = paramsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
     const body = createSchema.parse(req.body);
 
-    const count = await (prisma as any).webhook.count({ where: { groupId } });
-    if (count >= 10) {
-      throw Errors.badRequest(
-        "webhook_limit_reached",
-        "A group can have at most 10 webhooks"
-      );
-    }
+    // Same admin gate as POST /api/webhooks with a groupId: the endpoint
+    // streams group financial events to a caller-supplied URL. Check and
+    // insert run in one transaction for the same reason.
+    const webhook = await prisma.$transaction(async (tx) => {
+      await requireAdmin(groupId, auth.id, tx);
 
-    const webhook = await (prisma as any).webhook.create({
-      data: {
-        groupId,
-        userId: null,
-        url: body.url,
-        secret: createWebhookSecret(),
-        events: body.events,
-        enabled: true,
-      },
+      const count = await tx.webhook.count({ where: { groupId } });
+      if (count >= 10) {
+        throw Errors.badRequest(
+          "webhook_limit_reached",
+          "A group can have at most 10 webhooks"
+        );
+      }
+
+      return tx.webhook.create({
+        data: {
+          groupId,
+          userId: null,
+          url: body.url,
+          secret: createWebhookSecret(),
+          events: body.events,
+          enabled: true,
+        },
+      });
+    });
+
+    await audit({
+      userId: auth.id,
+      groupId,
+      action: "webhook.register",
+      entityType: "webhook",
+      entityId: webhook.id,
+      metadata: { url: body.url, events: body.events },
     });
 
     return { webhook: publicWebhook(webhook, true) };
